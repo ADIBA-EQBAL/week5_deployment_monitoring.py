@@ -1,0 +1,414 @@
+
+"""
+Week 5: Deployment and Monitoring Strategy for Agriculture
+
+Install:
+pip install pandas numpy scikit-learn joblib
+
+Expected CSV:
+crop_yield.csv
+
+Required target column:
+Yield
+
+The other columns are used as model features.
+Optional monitoring columns: Season, Region, Farm_ID.
+"""
+
+from pathlib import Path
+from datetime import datetime, timezone
+import json
+import warnings
+
+import joblib
+import numpy as np
+import pandas as pd
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+
+
+# --------------------------------------------------
+# 1. Configuration
+# --------------------------------------------------
+
+DATA_PATH = Path("crop_yield.csv")
+MODEL_PATH = Path("crop_yield_model.joblib")
+MONITORING_DIR = Path("monitoring_outputs")
+
+TARGET = "Yield"
+RANDOM_STATE = 42
+
+# Illustrative thresholds; customize using real farm data.
+MAX_MISSING_RATE = 0.20
+MAX_RELATIVE_MAE_PERCENT = 10.0
+MAX_ABSOLUTE_BIAS_PERCENT = 5.0
+
+MONITORING_DIR.mkdir(exist_ok=True)
+
+
+# --------------------------------------------------
+# 2. Load and validate data
+# --------------------------------------------------
+
+def load_data(path):
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} was not found. Add your agricultural CSV file."
+        )
+
+    data = pd.read_csv(path)
+
+    if TARGET not in data.columns:
+        raise ValueError(
+            f"Target '{TARGET}' not found. "
+            f"Available columns: {list(data.columns)}"
+        )
+
+    data[TARGET] = pd.to_numeric(data[TARGET], errors="coerce")
+    data = data.dropna(subset=[TARGET]).copy()
+
+    if data.empty:
+        raise ValueError("No valid target values remain in the dataset.")
+
+    return data
+
+
+# --------------------------------------------------
+# 3. Prepare model features
+# --------------------------------------------------
+
+def prepare_features(data):
+    # Metadata is kept for reporting, not used as predictors.
+    metadata_columns = [
+        column for column in ["Season", "Region", "Farm_ID"]
+        if column in data.columns
+    ]
+
+    metadata = data[metadata_columns].copy()
+
+    X = data.drop(
+        columns=[TARGET] + metadata_columns,
+        errors="ignore"
+    )
+
+    y = data[TARGET].astype(float)
+
+    if X.empty:
+        raise ValueError("No predictor columns are available.")
+
+    return X, y, metadata
+
+
+# --------------------------------------------------
+# 4. Build and train model
+# --------------------------------------------------
+
+def train_model(X_train, y_train):
+    numeric_columns = X_train.select_dtypes(
+        include=["number"]
+    ).columns.tolist()
+
+    categorical_columns = [
+        column for column in X_train.columns
+        if column not in numeric_columns
+    ]
+
+    numeric_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median"))
+    ])
+
+    categorical_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encoder", OneHotEncoder(handle_unknown="ignore"))
+    ])
+
+    preprocessing = ColumnTransformer([
+        ("numeric", numeric_pipeline, numeric_columns),
+        ("categorical", categorical_pipeline, categorical_columns)
+    ])
+
+    model_pipeline = Pipeline([
+        ("preprocessing", preprocessing),
+        ("model", RandomForestRegressor(
+            n_estimators=200,
+            max_depth=15,
+            min_samples_leaf=2,
+            random_state=RANDOM_STATE,
+            n_jobs=-1
+        ))
+    ])
+
+    model_pipeline.fit(X_train, y_train)
+
+    return model_pipeline
+
+
+# --------------------------------------------------
+# 5. Evaluate before deployment
+# --------------------------------------------------
+
+def evaluate_model(y_true, predictions):
+    mae = mean_absolute_error(y_true, predictions)
+    rmse = np.sqrt(mean_squared_error(y_true, predictions))
+    r2 = r2_score(y_true, predictions)
+
+    mean_actual = float(np.mean(y_true))
+    mean_bias = float(np.mean(
+        np.asarray(predictions) - np.asarray(y_true)
+    ))
+
+    if mean_actual != 0:
+        mae_percent = 100 * mae / abs(mean_actual)
+        bias_percent = 100 * mean_bias / abs(mean_actual)
+    else:
+        mae_percent = None
+        bias_percent = None
+
+    return {
+        "MAE": float(mae),
+        "RMSE": float(rmse),
+        "R2": float(r2),
+        "Mean_Bias": mean_bias,
+        "MAE_Percent_of_Mean": mae_percent,
+        "Bias_Percent_of_Mean": bias_percent
+    }
+
+
+# --------------------------------------------------
+# 6. Input data quality and anomaly checks
+# --------------------------------------------------
+
+def check_input_quality(new_data, training_data):
+    alerts = []
+
+    missing_rate = float(new_data.isna().mean().mean())
+
+    if missing_rate > MAX_MISSING_RATE:
+        alerts.append(
+            f"High missing-value rate: {missing_rate:.1%}"
+        )
+
+    # Check whether numeric values fall outside historical ranges.
+    for column in new_data.select_dtypes(include=["number"]).columns:
+        if column not in training_data.columns:
+            alerts.append(
+                f"Unexpected numeric feature: {column}"
+            )
+            continue
+
+        reference = pd.to_numeric(
+            training_data[column], errors="coerce"
+        ).dropna()
+
+        current = pd.to_numeric(
+            new_data[column], errors="coerce"
+        ).dropna()
+
+        if reference.empty or current.empty:
+            continue
+
+        low = reference.quantile(0.01)
+        high = reference.quantile(0.99)
+
+        unusual_count = int(
+            ((current < low) | (current > high)).sum()
+        )
+
+        if unusual_count:
+            alerts.append(
+                f"{column}: {unusual_count} values outside "
+                "the historical 1st-99th percentile range"
+            )
+
+    return {
+        "missing_rate": missing_rate,
+        "alerts": alerts
+    }
+
+
+# --------------------------------------------------
+# 7. Monitor actual prediction performance
+# --------------------------------------------------
+
+def monitor_predictions(actual, predicted):
+    metrics = evaluate_model(actual, predicted)
+    alerts = []
+
+    mae_percent = metrics["MAE_Percent_of_Mean"]
+    bias_percent = metrics["Bias_Percent_of_Mean"]
+
+    if (
+        mae_percent is not None
+        and mae_percent > MAX_RELATIVE_MAE_PERCENT
+    ):
+        alerts.append(
+            "Prediction MAE exceeds the configured threshold."
+        )
+
+    if (
+        bias_percent is not None
+        and abs(bias_percent) > MAX_ABSOLUTE_BIAS_PERCENT
+    ):
+        alerts.append(
+            "Systematic prediction bias exceeds the threshold."
+        )
+
+    return metrics, alerts
+
+
+# --------------------------------------------------
+# 8. Main deployment workflow
+# --------------------------------------------------
+
+def main():
+    print("Loading agricultural data...")
+    data = load_data(DATA_PATH)
+
+    X, y, metadata = prepare_features(data)
+
+    # For production use, replace random splitting with time-based
+    # or farm-grouped splitting when appropriate.
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.20,
+        random_state=RANDOM_STATE
+    )
+
+    print("Training model...")
+    model = train_model(X_train, y_train)
+
+    test_predictions = model.predict(X_test)
+    evaluation = evaluate_model(y_test, test_predictions)
+
+    print("\nPRE-DEPLOYMENT EVALUATION")
+    print(json.dumps(evaluation, indent=4))
+
+    # Save model and training feature schema.
+    joblib.dump(model, MODEL_PATH)
+
+    feature_schema = {
+        "features": list(X.columns),
+        "target": TARGET,
+        "trained_at_utc": datetime.now(
+            timezone.utc
+        ).isoformat()
+    }
+
+    with open(
+        MONITORING_DIR / "model_metadata.json",
+        "w",
+        encoding="utf-8"
+    ) as file:
+        json.dump(feature_schema, file, indent=4)
+
+    # Save test predictions for review.
+    prediction_report = pd.DataFrame({
+        "Actual_Yield": y_test,
+        "Predicted_Yield": test_predictions,
+        "Error": test_predictions - y_test.to_numpy()
+    }, index=X_test.index)
+
+    prediction_report.to_csv(
+        MONITORING_DIR / "test_predictions.csv",
+        index=True
+    )
+
+    # Monitor feature quality on the held-out test features.
+    quality_report = check_input_quality(X_test, X_train)
+
+    print("\nDATA QUALITY REPORT")
+    print(json.dumps(quality_report, indent=4))
+
+    # Evaluate by season when available.
+    if "Season" in metadata.columns:
+        test_seasons = metadata.loc[X_test.index, "Season"]
+        predictions_series = pd.Series(
+            test_predictions, index=X_test.index
+        )
+
+        seasonal_rows = []
+
+        for season in test_seasons.dropna().unique():
+            indices = test_seasons.index[
+                test_seasons == season
+            ]
+
+            if len(indices) < 2:
+                continue
+
+            season_metrics = evaluate_model(
+                y_test.loc[indices],
+                predictions_series.loc[indices]
+            )
+
+            season_metrics["Season"] = str(season)
+            season_metrics["Sample_Count"] = len(indices)
+            seasonal_rows.append(season_metrics)
+
+        if seasonal_rows:
+            pd.DataFrame(seasonal_rows).to_csv(
+                MONITORING_DIR / "seasonal_metrics.csv",
+                index=False
+            )
+
+    # Save deployment evaluation and alerts.
+    report = {
+        "generated_at_utc": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "model_file": str(MODEL_PATH),
+        "evaluation_metrics": evaluation,
+        "data_quality": quality_report,
+        "status": (
+            "REVIEW_REQUIRED"
+            if quality_report["alerts"]
+            else "INITIAL_CHECKS_PASSED"
+        )
+    }
+
+    with open(
+        MONITORING_DIR / "deployment_report.json",
+        "w",
+        encoding="utf-8"
+    ) as file:
+        json.dump(report, file, indent=4)
+
+    print("\nModel saved to:", MODEL_PATH)
+    print("Reports saved in:", MONITORING_DIR)
+    print(
+        "\nReminder: deployment checks do not prove production "
+        "readiness. Validate with representative farm and season data."
+    )
+
+
+# --------------------------------------------------
+# 9. Example for later monitoring
+# --------------------------------------------------
+
+def load_model_for_prediction():
+    """Load the saved model when the application needs a prediction."""
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            "Model file not found. Train and save the model first."
+        )
+
+    return joblib.load(MODEL_PATH)
+
+
+def predict_new_yield(new_data):
+    """
+    new_data must contain the same predictor columns used in training.
+    Returns predictions in the target's original units.
+    """
+    model = load_model_for_prediction()
+    return model.predict(new_data)
+
+
+if __name__ == "__main__":
+    main()
